@@ -32,6 +32,11 @@ export interface AccountMeta {
   needsReloginReason: string | null;
   /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
   variant?: WbVariant;
+  /**
+   * 企业版账号（有 enterpriseId，或 type 为 ultimate/exclusive）；
+   * 缺省（旧后端/历史账号）按非企业处理。
+   */
+  isEnterprise?: boolean;
 }
 
 export interface AppStatus {
@@ -582,14 +587,18 @@ export interface CreditExpiry {
   accountId?: string | null;
   accountName?: string;
   updatedAt?: number;
-  totalCapacity?: number;
-  totalRemaining?: number;
+  /** 企业版不限量（limitNum=-1）时为 null，展示按 `unlimited` 分支。 */
+  totalCapacity?: number | null;
+  /** 企业版不限量（limitNum=-1）时为 null，展示按 `unlimited` 分支。 */
+  totalRemaining?: number | null;
   expiringSoonRemaining?: number;
   expiredRemaining?: number;
   soonestExpireAt?: number | null;
   expiringSoon?: boolean;
   expired?: boolean;
   resources?: CreditResource[];
+  /** 企业配额不限量：数字字段为 null、资源列表为空，不当作 0 展示。 */
+  unlimited?: boolean;
   error?: string;
 }
 
