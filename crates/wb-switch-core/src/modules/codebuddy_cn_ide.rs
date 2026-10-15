@@ -9,19 +9,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::modules::account::{self, get_str};
+#[cfg(not(target_os = "windows"))]
+use crate::modules::config::home_dir;
 use crate::modules::config::{
     atomic_write, clear_codebuddy_cn_app_cache, load_codebuddy_cn_app_cache, now_ms,
     save_codebuddy_cn_app_cache, store_dir,
 };
-#[cfg(target_os = "macos")]
-use crate::modules::config::home_dir;
 // 复用 process 模块带并发管道读取的正确实现；本地轮询版会在子进程输出
 // 超过 64KB（如 `ps -axo pid=,args=`）时因管道写满而死锁到超时。
 use crate::modules::process;
 use crate::modules::process::run_cmd_timeout as run_cmd;
+use crate::modules::variant::codebuddy_domain_for;
 use crate::modules::vscode_cn_inject::{
-    codebuddy_cn_data_dir, codebuddy_cn_state_db_path, inject_codebuddy_cn_secret,
-    read_codebuddy_cn_secret,
+    codebuddy_cn_data_dir, codebuddy_cn_state_db_path, has_secret_row_for,
+    inject_codebuddy_cn_secret, read_codebuddy_cn_secret, CODEBUDDY_CN_TARGET,
 };
 
 const STATE_FILE: &str = "codebuddy_cn_ide.json";
@@ -78,7 +79,10 @@ pub fn build_session_json(acc: &Value) -> String {
     let enterprise_name = get_str(acc, "enterpriseName")
         .or_else(|| get_str(acc, "enterprise_name"))
         .unwrap_or_default();
-    let domain = get_str(acc, "domain").unwrap_or_default();
+    let domain = codebuddy_domain_for(
+        get_str(acc, "domain").unwrap_or_default().as_str(),
+        account::variant_of(acc),
+    );
     let refresh_token = get_str(acc, "refresh_token").unwrap_or_default();
     let access_token = get_str(acc, "access_token").unwrap_or_default();
     let token_type = get_str(acc, "token_type").unwrap_or_else(|| "Bearer".to_string());
@@ -117,7 +121,10 @@ pub fn build_session_json(acc: &Value) -> String {
     .to_string()
 }
 
-fn parse_token_from_secret(secret: &str) -> Option<(Option<String>, String)> {
+/// 从 secret 明文（JSON 或 `uid+token`）解析出 (uid, access_token)。
+///
+/// 同时供 CodeBuddy CN IDE 与 VS Code CodeBuddy 扩展（`vscode_ext`）复用。
+pub(crate) fn parse_token_from_secret(secret: &str) -> Option<(Option<String>, String)> {
     let trimmed = secret.trim();
     if trimmed.is_empty() {
         return None;
@@ -182,10 +189,14 @@ fn parse_token_from_secret(secret: &str) -> Option<(Option<String>, String)> {
     Some((None, trimmed.to_string()))
 }
 
-fn match_account_for_token(uid: Option<&str>, token: &str) -> Option<Value> {
+/// 在账号库中按 uid / access_token 匹配账号；供 CN IDE 与 VS Code 扩展复用。
+pub(crate) fn match_account_for_token(uid: Option<&str>, token: &str) -> Option<Value> {
     let accounts = account::load_accounts();
     if let Some(uid) = uid.filter(|s| !s.is_empty()) {
-        if let Some(acc) = accounts.iter().find(|a| get_str(a, "uid").as_deref() == Some(uid)) {
+        if let Some(acc) = accounts
+            .iter()
+            .find(|a| get_str(a, "uid").as_deref() == Some(uid))
+        {
             return Some(acc.clone());
         }
     }
@@ -555,6 +566,24 @@ fn linux_cmdline_is_codebuddy_cn(cmdline: &str) -> bool {
     cmdline.contains("CodeBuddy CN")
         || lower.contains("codebuddy-cn")
         || lower.contains("codebuddycn")
+        // deb 包把二进制装成 buddycn（/usr/share/buddycn/buddycn），
+        // 只认 codebuddy-* 会漏掉这种打包方式。
+        || lower.contains("buddycn")
+}
+
+/// Linux 可执行文件名是否属于 CN 客户端。
+///
+/// 各发行包命名不统一：deb 是 `buddycn`，也有 `codebuddy-cn` / `codebuddycn`，
+/// AppImage 常见 `CodeBuddy-CN-1.2.3.AppImage`。统一去掉分隔符再比前缀，
+/// 这样 `CodeBuddy_CN.AppImage` 一类写法也能命中；国际版 `codebuddy` /
+/// `workbuddy` 不匹配。
+fn linux_exe_name_matches_cn(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    normalized.starts_with("codebuddycn") || normalized.starts_with("buddycn")
 }
 
 #[cfg_attr(
@@ -562,14 +591,11 @@ fn linux_cmdline_is_codebuddy_cn(cmdline: &str) -> bool {
     allow(dead_code)
 )]
 fn linux_exe_is_codebuddy_cn(exe: &Path) -> bool {
-    let name = exe
-        .file_name()
+    exe.file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .trim();
-    name.eq_ignore_ascii_case("codebuddy-cn")
-        || name.eq_ignore_ascii_case("codebuddycn")
-        || is_codebuddy_cn_image_name(name)
+        .map(|n| n.trim())
+        .map(linux_exe_name_matches_cn)
+        .unwrap_or(false)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -635,6 +661,207 @@ fn kill_linux_pids(pids: &[u32], signal: &str) {
     let _ = run_cmd("kill", &args, 10);
 }
 
+/// Linux 可执行文件名候选（按顺序在 PATH 里查找）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const LINUX_CN_EXE_NAMES: &[&str] = &["buddycn", "codebuddy-cn", "codebuddycn"];
+
+/// Linux: 按 XDG 规则列出 applications 目录（用户级在前，用户条目可覆盖系统条目）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn linux_application_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| Some(home_dir().join(".local/share")));
+    if let Some(data_home) = data_home {
+        dirs.push(data_home.join("applications"));
+        // flatpak 把导出的条目放在这里，不在 XDG_DATA_DIRS 里。
+        dirs.push(data_home.join("flatpak/exports/share/applications"));
+    }
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+    for base in data_dirs.split(':').filter(|s| !s.is_empty()) {
+        dirs.push(Path::new(base).join("applications"));
+    }
+    // snap 导出的 .desktop 固定在这里，同样不在 XDG_DATA_DIRS 里。
+    dirs.push(PathBuf::from("/var/lib/snapd/desktop/applications"));
+    dirs
+}
+
+/// 按 shell 规则切分 .desktop 的 `Exec=`（双引号 / 反斜杠转义）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn linux_split_exec(exec: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = exec.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                } else {
+                    current.push(c);
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                c => current.push(c),
+            },
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// 取 `Exec=` 里的启动程序：跳过 `env VAR=x` 前缀与 `%F`/`%U` 一类字段码。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn linux_exec_program(exec: &str) -> Option<String> {
+    let mut tokens = linux_split_exec(exec);
+    while let Some(first) = tokens.first() {
+        if first == "env" || first.contains('=') {
+            tokens.remove(0);
+        } else {
+            break;
+        }
+    }
+    tokens.into_iter().next()
+}
+
+/// 从单个 .desktop 条目解析 CN 的启动命令；不是 CN、是 URL handler 或程序不存在时返回 None。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn linux_cn_exe_from_desktop_entry(path: &Path) -> Option<PathBuf> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut name: Option<String> = None;
+    let mut exec: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("Name=") {
+            name.get_or_insert_with(|| value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Exec=") {
+            exec.get_or_insert_with(|| value.trim().to_string());
+        }
+    }
+    // 非本地化 `Name=` 才算数：本地化条目与主条目指向同一个程序。
+    let name = name?;
+    let is_cn_name = name.eq_ignore_ascii_case("CodeBuddy CN")
+        || stem.starts_with("buddycn")
+        || stem.starts_with("codebuddy-cn")
+        || stem.starts_with("codebuddycn");
+    if !is_cn_name {
+        return None;
+    }
+    let exec = exec?;
+    // URL handler 条目同样是 CN 的，但需要带 URL 参数才能启动主程序。
+    if stem.contains("url-handler") || exec.contains("--open-url") {
+        return None;
+    }
+    let program = linux_exec_program(&exec)?;
+    let program_path = if program.contains('/') {
+        PathBuf::from(program)
+    } else {
+        linux_which(&program)?
+    };
+    program_path.is_file().then_some(program_path)
+}
+
+/// 在 PATH 里查找可执行文件（不依赖 which 命令）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn linux_which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Linux 上 CN 可执行文件的候选路径，按可信度排序。
+///
+/// 第一优先级是 XDG 桌面条目：它与打包方式无关（deb / snap / flatpak / 做过桌面集成的
+/// AppImage 都会导出 .desktop），且直接给出真正的启动命令——例如 deb 包
+/// `buddycn.desktop` 的 `Exec=/usr/share/buddycn/bin/buddycn %F`，而旧实现只找
+/// `/usr/bin/codebuddy-cn`，在真实发行包上必然落空。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn linux_cn_exe_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    let mut desktop_entries: Vec<PathBuf> = Vec::new();
+    for dir in linux_application_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            // 先按文件名粗筛，避免逐个读入上百个无关条目。
+            let stem = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if stem.contains("buddy") {
+                desktop_entries.push(path);
+            }
+        }
+    }
+    desktop_entries.sort();
+    for entry in desktop_entries {
+        if let Some(exe) = linux_cn_exe_from_desktop_entry(&entry) {
+            candidates.push(exe);
+        }
+    }
+
+    for name in LINUX_CN_EXE_NAMES {
+        if let Some(path) = linux_which(name) {
+            candidates.push(path);
+        }
+    }
+
+    candidates.extend(
+        [
+            "/usr/bin/buddycn",
+            "/usr/share/buddycn/bin/buddycn",
+            "/usr/share/buddycn/buddycn",
+            "/usr/local/bin/buddycn",
+            "/usr/bin/codebuddy-cn",
+            "/usr/local/bin/codebuddy-cn",
+            "/opt/codebuddy-cn/codebuddy-cn",
+            "/opt/buddycn/buddycn",
+        ]
+        .iter()
+        .map(PathBuf::from),
+    );
+
+    let mut deduped: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if !deduped.contains(&candidate) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
 /// 解析 CodeBuddy CN 应用路径（macOS: .app bundle；Windows: exe）。
 pub fn codebuddy_cn_app_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
@@ -653,14 +880,8 @@ pub fn codebuddy_cn_app_path() -> Option<PathBuf> {
             }
             clear_codebuddy_cn_app_cache();
         }
-        let candidates = [
-            "/usr/bin/codebuddy-cn",
-            "/usr/local/bin/codebuddy-cn",
-            "/opt/codebuddy-cn/codebuddy-cn",
-        ];
-        for p in candidates {
-            let path = PathBuf::from(p);
-            if path.is_file() {
+        for path in linux_cn_exe_candidates() {
+            if path.is_file() && linux_exe_is_codebuddy_cn(&path) {
                 persist_cn_app_cache(&path);
                 return Some(path);
             }
@@ -694,7 +915,11 @@ fn close_codebuddy_cn_macos(timeout_secs: i64) -> Result<(), String> {
     let resolved = macos_cn_app_path_resolved();
     let main_patterns = macos_cn_main_patterns(resolved.as_deref());
     let bundle_patterns = macos_cn_bundle_patterns(resolved.as_deref());
-    let remaining = || timeout.saturating_sub(started.elapsed()).max(Duration::from_millis(100));
+    let remaining = || {
+        timeout
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(100))
+    };
 
     let quit_script = format!("quit app id \"{MACOS_BUNDLE_ID}\"");
     let quit = run_cmd("osascript", &["-e", quit_script.as_str()], 10);
@@ -788,8 +1013,16 @@ fn close_codebuddy_cn_linux(timeout_secs: i64) -> Result<(), String> {
     }
     Err(format!(
         "CodeBuddy CN 进程无法关闭（残留进程: {}）。请手动执行: kill -9 {}",
-        leftover.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
-        leftover.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
+        leftover
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        leftover
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     ))
 }
 
@@ -917,7 +1150,7 @@ pub fn launch_codebuddy_cn() -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let exe = codebuddy_cn_app_path().ok_or_else(|| {
-            "未找到 CodeBuddy CN 可执行文件（尝试路径: /usr/bin/codebuddy-cn）。请先手动打开一次。".to_string()
+            "未找到 CodeBuddy CN 可执行文件。已查过桌面条目（.desktop 的 Exec）与常见路径：/usr/bin/buddycn、/usr/share/buddycn/bin/buddycn、/usr/bin/codebuddy-cn。请先手动打开一次 CodeBuddy CN。".to_string()
         })?;
         process::cmd_builder(&exe)
             .stdout(std::process::Stdio::null())
@@ -932,10 +1165,15 @@ pub fn launch_codebuddy_cn() -> Result<(), String> {
 pub fn status() -> Value {
     let data_dir = codebuddy_cn_data_dir();
     let db_path = codebuddy_cn_state_db_path();
-    let installed = codebuddy_cn_app_path().is_some()
-        || data_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
+    // `installed` 只表示"存在可运行的客户端"。数据目录存在不能算已安装——
+    // 只读探测不再建目录（issue #91），残留空目录也不应误报「已接入」；
+    // 是否有残留数据由 dataDir / dbExists 表达。
+    let installed = codebuddy_cn_app_path().is_some();
     let db_exists = db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
     let running = is_codebuddy_cn_running();
+    // 登录态 = `state.vscdb` 里是否存在会话 secret 行：只查 key、不解密（macOS 解密会弹
+    // 钥匙串授权，绝不能进这条轮询路径）。查询失败/文件不存在一律 false，仅用于文案与入口判定。
+    let logged_in = has_secret_row_for(&CODEBUDDY_CN_TARGET, data_dir.as_deref()).unwrap_or(false);
 
     let mut active_account_id = active_account_id_from_state();
     let mut active_account_name: Option<String> = None;
@@ -952,6 +1190,7 @@ pub fn status() -> Value {
     json!({
         "installed": installed,
         "running": running,
+        "loggedIn": logged_in,
         "dataDir": data_dir.map(|p| p.to_string_lossy().to_string()),
         "dbPath": db_path.map(|p| p.to_string_lossy().to_string()),
         "dbExists": db_exists,
@@ -965,31 +1204,52 @@ pub fn status() -> Value {
 
 /// 切换 CodeBuddy CN IDE 账号：关进程 → 注入 secret → 启动。
 pub fn switch_account(account_id: &str, restart: bool) -> Result<Value, String> {
-    let acc = account::find_account(account_id)
-        .ok_or_else(|| format!("账号不存在: {account_id}"))?;
-    let token = get_str(&acc, "access_token")
-        .ok_or_else(|| "账号缺少 access_token，无法注入 CodeBuddy CN".to_string())?;
-    if token.is_empty() {
-        return Err("账号 access_token 为空".to_string());
-    }
-
-    let data_dir = codebuddy_cn_data_dir()
-        .ok_or_else(|| "无法定位 CodeBuddy CN 数据目录".to_string())?;
-    if !data_dir.exists() {
-        return Err(format!(
-            "未找到 CodeBuddy CN 用户数据目录（{}）。请先手动打开 CodeBuddy CN 并登录一次。",
-            data_dir.display()
-        ));
-    }
+    let (acc, data_dir) = validate_switch_target(account_id)?;
 
     if restart {
         eprintln!("[codebuddy-cn-ide] closing CodeBuddy CN…");
         close_codebuddy_cn(20)?;
     }
 
-    let session = build_session_json(&acc);
+    inject_session_and_finish(account_id, &acc, &data_dir, restart)
+}
+
+/// 切换前置校验：账号存在 + `access_token` 非空 + 用户数据目录存在。返回账号条目与数据目录。
+///
+/// 必须在关闭 IDE **之前**执行：账号不存在、token 为空、数据目录缺失这类「无论怎么关都
+/// 注定失败」的目标，不该让用户的 IDE 被关掉。幂等且廉价，注入前会再次使用返回的数据目录。
+pub(crate) fn validate_switch_target(account_id: &str) -> Result<(Value, PathBuf), String> {
+    let acc =
+        account::find_account(account_id).ok_or_else(|| format!("账号不存在: {account_id}"))?;
+    let token = get_str(&acc, "access_token")
+        .ok_or_else(|| "账号缺少 access_token，无法注入 CodeBuddy CN".to_string())?;
+    if token.is_empty() {
+        return Err("账号 access_token 为空".to_string());
+    }
+
+    let data_dir =
+        codebuddy_cn_data_dir().ok_or_else(|| "无法定位 CodeBuddy CN 数据目录".to_string())?;
+    if !data_dir.exists() {
+        return Err(format!(
+            "未找到 CodeBuddy CN 用户数据目录（{}）。请先手动打开 CodeBuddy CN 并登录一次。",
+            data_dir.display()
+        ));
+    }
+    Ok((acc, data_dir))
+}
+
+/// 「已可切换」后执行：注入 secret → 记录当前账号 → 按需重启（关闭动作由调用方负责）。
+///
+/// 会话复制等前置写入完成后调用的就是这一步，因此它不碰进程关闭逻辑。
+pub(crate) fn inject_session_and_finish(
+    account_id: &str,
+    acc: &Value,
+    data_dir: &Path,
+    restart: bool,
+) -> Result<Value, String> {
+    let session = build_session_json(acc);
     eprintln!("[codebuddy-cn-ide] injecting secret…");
-    let db_path = inject_codebuddy_cn_secret(&session, Some(&data_dir)).map_err(|err| {
+    let db_path = inject_codebuddy_cn_secret(&session, Some(data_dir)).map_err(|err| {
         if err.contains("Safe Storage") || err.contains("Keychain") {
             format!(
                 "注入登录状态失败：{err}\n\n请先手动打开 CodeBuddy CN 并登录一次，确保 Keychain 中存在「CodeBuddy CN Safe Storage」条目后再试。"
@@ -1008,16 +1268,34 @@ pub fn switch_account(account_id: &str, restart: bool) -> Result<Value, String> 
 
     Ok(json!({
         "ok": true,
-        "account": account::account_display_name(&acc),
+        "account": account::account_display_name(acc),
         "accountId": account_id,
         "dbPath": db_path.to_string_lossy(),
         "restarted": restart,
         "message": if restart {
-            format!("已切换 CodeBuddy IDE 到 {} 并重启", account::account_display_name(&acc))
+            format!("已切换 CodeBuddy IDE 到 {} 并重启", account::account_display_name(acc))
         } else {
-            format!("已写入 CodeBuddy IDE 凭证（{}）；请手动重启 CodeBuddy CN 生效", account::account_display_name(&acc))
+            format!("已写入 CodeBuddy IDE 凭证（{}）；请手动重启 CodeBuddy CN 生效", account::account_display_name(acc))
         },
     }))
+}
+
+/// 当前 CodeBuddy CN IDE 登录账号的 uid（用于定位可复制的会话目录）。
+///
+/// 优先从本机 IDE 登录 secret 解析 uid（与切号注入的是同一处真相）；不可用时回退到
+/// 本地状态文件记录的账号 id → 账号库 uid。任一来源都拿不到时返回 `None`（调用方据此给出空态）。
+pub fn active_cn_ide_uid() -> Option<String> {
+    if let Ok(Some(secret)) = read_codebuddy_cn_secret(None) {
+        if let Some((Some(uid), _token)) = parse_token_from_secret(&secret) {
+            let uid = uid.trim().to_string();
+            if !uid.is_empty() {
+                return Some(uid);
+            }
+        }
+    }
+    active_account_id_from_state()
+        .and_then(|id| account::find_account(&id))
+        .and_then(|acc| get_str(&acc, "uid"))
 }
 
 /// 从本机 CN IDE 读取当前 token；若能匹配账号库则返回匹配信息（不新建账号）。
@@ -1146,25 +1424,158 @@ mod tests {
             Some("Zhou"),
             &['C'],
         );
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        assert!(s.iter().any(|p| p.contains("Programs") && p.contains("CodeBuddy CN.exe")));
-        assert!(s.iter().any(|p| p.contains("CodeBuddy CN") && p.contains("CodeBuddy.exe")));
-        assert!(s.iter().any(|p| p.contains("Program Files") && p.contains("CodeBuddy CN.exe")));
-        assert!(!s.iter().any(|p| {
-            p.contains("CodeBuddy.exe") && !path_contains_codebuddy_cn_dir(p)
-        }));
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(s
+            .iter()
+            .any(|p| p.contains("Programs") && p.contains("CodeBuddy CN.exe")));
+        assert!(s
+            .iter()
+            .any(|p| p.contains("CodeBuddy CN") && p.contains("CodeBuddy.exe")));
+        assert!(s
+            .iter()
+            .any(|p| p.contains("Program Files") && p.contains("CodeBuddy CN.exe")));
+        assert!(!s
+            .iter()
+            .any(|p| { p.contains("CodeBuddy.exe") && !path_contains_codebuddy_cn_dir(p) }));
     }
 
     #[test]
     fn linux_cmdline_matcher_accepts_cn_not_switcher() {
-        assert!(linux_cmdline_is_codebuddy_cn("/opt/codebuddy-cn/codebuddy-cn --foo"));
+        assert!(linux_cmdline_is_codebuddy_cn(
+            "/opt/codebuddy-cn/codebuddy-cn --foo"
+        ));
         assert!(linux_cmdline_is_codebuddy_cn("/usr/bin/CodeBuddy CN"));
-        assert!(linux_exe_is_codebuddy_cn(Path::new("/usr/bin/codebuddy-cn")));
+        assert!(linux_exe_is_codebuddy_cn(Path::new(
+            "/usr/bin/codebuddy-cn"
+        )));
         assert!(!linux_cmdline_is_codebuddy_cn("/usr/bin/workbuddy-switch"));
         assert!(!linux_cmdline_is_codebuddy_cn(
             "/opt/codebuddy-cn/codebuddy-cn --type=gpu-process"
         ));
         assert!(!linux_exe_is_codebuddy_cn(Path::new("/usr/bin/codebuddy")));
+    }
+
+    #[test]
+    fn linux_exe_matcher_accepts_real_package_names() {
+        // deb 包（/usr/share/buddycn/buddycn）与 AppImage 命名都要认。
+        assert!(linux_exe_is_codebuddy_cn(Path::new(
+            "/usr/share/buddycn/buddycn"
+        )));
+        assert!(linux_exe_is_codebuddy_cn(Path::new(
+            "/home/u/Applications/CodeBuddy_CN-1.2.3.AppImage"
+        )));
+        assert!(linux_exe_is_codebuddy_cn(Path::new(
+            "/snap/bin/codebuddy-cn"
+        )));
+        assert!(linux_cmdline_is_codebuddy_cn(
+            "/usr/share/buddycn/bin/buddycn --unity-launch"
+        ));
+        // 国际版与自家程序不算
+        assert!(!linux_exe_is_codebuddy_cn(Path::new(
+            "/opt/CodeBuddy/codebuddy"
+        )));
+        assert!(!linux_exe_is_codebuddy_cn(Path::new(
+            "/opt/WorkBuddy/workbuddy"
+        )));
+        assert!(!linux_exe_is_codebuddy_cn(Path::new(
+            "/home/u/Dev/workbuddy-switch/target/debug/wb-switch-rust"
+        )));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn linux_exec_program_drops_field_codes_and_env_prefix() {
+        assert_eq!(
+            linux_exec_program("/usr/share/buddycn/bin/buddycn %F").as_deref(),
+            Some("/usr/share/buddycn/bin/buddycn")
+        );
+        assert_eq!(
+            linux_exec_program("\"/opt/CodeBuddy CN/codebuddy-cn\" --flag %U").as_deref(),
+            Some("/opt/CodeBuddy CN/codebuddy-cn")
+        );
+        assert_eq!(
+            linux_exec_program("env FOO=1 /usr/bin/buddycn %U").as_deref(),
+            Some("/usr/bin/buddycn")
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn linux_desktop_entry_resolves_cn_and_skips_lookalikes() {
+        let dir = std::env::temp_dir().join(format!("wb-cn-desktop-{}", uuid::Uuid::new_v4()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("buddycn");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        let write = |name: &str, name_field: &str, exec: &str| {
+            let path = dir.join(name);
+            let body =
+                format!("[Desktop Entry]\nType=Application\nName={name_field}\nExec={exec}\n");
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+
+        // 真实 deb 包条目：Exec=/usr/share/buddycn/bin/buddycn %F
+        let cn = write(
+            "buddycn.desktop",
+            "CodeBuddy CN",
+            &format!("{} %F", exe.display()),
+        );
+        assert_eq!(linux_cn_exe_from_desktop_entry(&cn), Some(exe.clone()));
+
+        // URL handler 同名同程序，但需要 URL 参数才能启动，不能当主入口
+        let url = write(
+            "buddycn-url-handler.desktop",
+            "CodeBuddy CN - URL Handler",
+            &format!("{} --open-url %U", exe.display()),
+        );
+        assert_eq!(linux_cn_exe_from_desktop_entry(&url), None);
+
+        // 国际版 CodeBuddy 与自家 workbuddy-switch 都不算
+        let intl = write(
+            "codebuddy.desktop",
+            "CodeBuddy",
+            &format!("{} %U", exe.display()),
+        );
+        assert_eq!(linux_cn_exe_from_desktop_entry(&intl), None);
+        let own = write(
+            "workbuddy-switch.desktop",
+            "workbuddy-switch",
+            &format!("{} %U", exe.display()),
+        );
+        assert_eq!(linux_cn_exe_from_desktop_entry(&own), None);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 回归：真实发行包必须被发现并认成 CN。
+    ///
+    /// 只在装了 CN 桌面条目且条目可解析的机器上验证（CI 与未安装环境直接跳过）。
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn linux_finds_installed_cn_executable_from_desktop_entry() {
+        let desktop_exe = linux_application_dirs().iter().find_map(|dir| {
+            let entries = std::fs::read_dir(dir).ok()?;
+            entries
+                .flatten()
+                .find_map(|entry| linux_cn_exe_from_desktop_entry(&entry.path()))
+        });
+        let Some(desktop_exe) = desktop_exe else {
+            return;
+        };
+        assert!(
+            linux_cn_exe_candidates().contains(&desktop_exe),
+            "桌面条目指向的 {} 未出现在候选列表里",
+            desktop_exe.display()
+        );
+        assert!(
+            linux_exe_is_codebuddy_cn(&desktop_exe),
+            "{} 未被认成 CodeBuddy CN",
+            desktop_exe.display()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1183,7 +1594,10 @@ mod tests {
             vec!["/Applications/CodeBuddy CN.app/Contents/MacOS".to_string()]
         );
         let cands = macos_cn_app_candidates(Path::new("/Users/tester"));
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             s,
             vec![
@@ -1209,7 +1623,8 @@ mod tests {
         let main_pids: Vec<u32> = main_kept.iter().map(|(pid, _)| *pid).collect();
         assert_eq!(main_pids, vec![6001]);
 
-        let bundle_kept = process::filter_ps_rows(&stdout, &macos_cn_bundle_patterns(None), self_pid);
+        let bundle_kept =
+            process::filter_ps_rows(&stdout, &macos_cn_bundle_patterns(None), self_pid);
         let bundle_pids: Vec<u32> = bundle_kept.iter().map(|(pid, _)| *pid).collect();
         assert_eq!(bundle_pids, vec![6001, 6004]);
     }

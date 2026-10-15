@@ -13,22 +13,39 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
-import type { ImportPreviewAccount } from "@/lib/types";
+import { DEFAULT_VARIANT, variantLabel } from "@/lib/variant";
+import type { ImportPreviewAccount, WbVariant } from "@/lib/types";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** 导入完成后回调（参数为导入结果计数）。 */
-  onImported?: (result: { imported: number; skipped: number; overwritten: number }) => void;
+  /** 导入完成后回调（参数为导入结果计数，附所选账号中的加密凭据数）。 */
+  onImported?: (result: {
+    imported: number;
+    skipped: number;
+    overwritten: number;
+    encrypted: number;
+  }) => void;
+  /** 当前档位；仅用于文案，导入结果按文件内各账号自身的档位归类。 */
+  variant?: WbVariant;
 }
 
-/** 导入预览账号展示名（脱敏展示：昵称/邮箱/uid）。 */
+/**
+ * 导入预览账号展示名（脱敏展示：昵称/邮箱/uid）。
+ * 只接受字符串：旧后端可能把信封对象透传进来，渲染对象会触发 React error #31（白屏）。
+ */
 function previewLabel(a: ImportPreviewAccount): string {
-  return a.nickname || a.email || a.uid || `第 ${a.index + 1} 项`;
+  const asLabel = (v: unknown) => (typeof v === "string" ? v : "");
+  return asLabel(a.nickname) || asLabel(a.email) || asLabel(a.uid) || `第 ${a.index + 1} 项`;
 }
 
 /** 导入账号弹框：选 JSON 文件 → 后端解析预览 → 勾选账号 → 导入合并。 */
-export function ImportAccountsDialog({ open, onOpenChange, onImported }: Props) {
+export function ImportAccountsDialog({
+  open,
+  onOpenChange,
+  onImported,
+  variant = DEFAULT_VARIANT,
+}: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [fileName, setFileName] = useState("");
   const [fileText, setFileText] = useState("");
@@ -102,8 +119,10 @@ export function ImportAccountsDialog({ open, onOpenChange, onImported }: Props) 
     setBusy(true);
     setError("");
     try {
+      // 所选账号中的加密凭据数：随导入结果上报，供宿主附加能力限制提醒。
+      const encrypted = preview.filter((a) => selected.has(a.index) && a.encrypted).length;
       const res = await api.importAccounts(fileText, [...selected]);
-      onImported?.(res);
+      onImported?.({ ...res, encrypted });
       onOpenChange(false);
     } catch (e) {
       setError(api.asError(e));
@@ -117,7 +136,11 @@ export function ImportAccountsDialog({ open, onOpenChange, onImported }: Props) 
       <DialogContent className="min-w-0 overflow-x-hidden">
         <DialogHeader>
           <DialogTitle>导入账号</DialogTitle>
-          <DialogDescription>选择 JSON 文件，勾选要导入的账号。</DialogDescription>
+          <DialogDescription>
+            选择 JSON 文件，勾选要导入的账号。
+            {variant === "ai" &&
+              `备份中的国内版与国际版账号按各自档位归类，不随当前${variantLabel(variant)}改变。`}
+          </DialogDescription>
         </DialogHeader>
 
         <input
@@ -148,7 +171,7 @@ export function ImportAccountsDialog({ open, onOpenChange, onImported }: Props) 
               <span className="text-muted-foreground">
                 共 {preview.length} 个账号，已选 {selected.size} 个
               </span>
-              <button type="button" className="text-primary hover:underline" onClick={toggleAll}>
+              <button type="button" className="cursor-pointer text-primary hover:underline" onClick={toggleAll}>
                 {allSelected ? "取消全选" : "全选"}
               </button>
             </div>
@@ -165,7 +188,11 @@ export function ImportAccountsDialog({ open, onOpenChange, onImported }: Props) 
                     onChange={() => toggle(a.index)}
                   />
                   <span className="min-w-0 flex-1 truncate text-sm">{previewLabel(a)}</span>
-                  {!a.hasToken && <Badge variant="outline">缺少 token</Badge>}
+                  {a.encrypted ? (
+                    <Badge variant="secondary">加密凭据</Badge>
+                  ) : (
+                    !a.hasToken && <Badge variant="outline">缺少 token</Badge>
+                  )}
                 </label>
               ))}
             </div>

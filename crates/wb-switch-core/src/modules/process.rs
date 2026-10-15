@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use crate::modules::auth_file;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use crate::modules::config;
+use crate::modules::variant::WbVariant;
 
 /// 创建子进程命令。Windows 上加 CREATE_NO_WINDOW，避免每次执行 tasklist/powershell
 /// 等控制台命令时闪出 cmd 黑窗口（GUI 应用卡顿/跳动的主因）。
@@ -102,10 +103,22 @@ pub(crate) fn is_self_image_name(name: &str) -> bool {
     stem.eq_ignore_ascii_case("workbuddy-switch") || stem.eq_ignore_ascii_case("wb-switch")
 }
 
-/// 精确匹配 WorkBuddy / CodeBuddy 映像，禁止子串命中 workbuddy-switch。
-fn is_workbuddy_image_name(name: &str) -> bool {
+/// 精确匹配本档位的 WorkBuddy 映像，禁止子串命中其它档位或 workbuddy-switch。
+fn is_workbuddy_image_name(name: &str, variant: WbVariant) -> bool {
     let stem = image_stem(image_name_from_path_str(name));
-    stem.eq_ignore_ascii_case("WorkBuddy") || stem.eq_ignore_ascii_case("CodeBuddy")
+    variant
+        .windows_image_names()
+        .iter()
+        .any(|candidate| stem.eq_ignore_ascii_case(candidate))
+}
+
+/// 本档位的 Windows 可执行文件名。
+fn windows_exe_names(variant: WbVariant) -> Vec<String> {
+    variant
+        .windows_image_names()
+        .iter()
+        .map(|name| format!("{name}.exe"))
+        .collect()
 }
 
 pub(crate) fn is_crashpad_helper_name(name: &str) -> bool {
@@ -156,6 +169,7 @@ fn windows_fallback_exe_candidates(
     program_files_x86: Option<&str>,
     username: Option<&str>,
     drives: &[char],
+    variant: WbVariant,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut push = |p: PathBuf| {
@@ -164,25 +178,27 @@ fn windows_fallback_exe_candidates(
         }
     };
     let mut push_win_dir = |parts: &[&str]| {
-        let mut wb = parts.to_vec();
-        wb.push("WorkBuddy.exe");
-        push(windows_path(&wb));
-        let mut cb = parts.to_vec();
-        cb.push("CodeBuddy.exe");
-        push(windows_path(&cb));
+        for exe in windows_exe_names(variant) {
+            let mut wb = parts.to_vec();
+            wb.push(&exe);
+            push(windows_path(&wb));
+        }
     };
 
     if let Some(local) = local_appdata.map(str::trim).filter(|s| !s.is_empty()) {
-        push_win_dir(&[local, "Programs", "WorkBuddy"]);
-        push_win_dir(&[local, "Programs", "CodeBuddy"]);
+        for dir in variant.windows_image_names() {
+            push_win_dir(&[local, "Programs", dir]);
+        }
     }
     if let Some(pf) = program_files.map(str::trim).filter(|s| !s.is_empty()) {
-        push_win_dir(&[pf, "WorkBuddy"]);
-        push_win_dir(&[pf, "CodeBuddy"]);
+        for dir in variant.windows_image_names() {
+            push_win_dir(&[pf, dir]);
+        }
     }
     if let Some(pf86) = program_files_x86.map(str::trim).filter(|s| !s.is_empty()) {
-        push_win_dir(&[pf86, "WorkBuddy"]);
-        push_win_dir(&[pf86, "CodeBuddy"]);
+        for dir in variant.windows_image_names() {
+            push_win_dir(&[pf86, dir]);
+        }
     }
 
     let user = username.map(str::trim).filter(|s| !s.is_empty());
@@ -193,27 +209,13 @@ fn windows_fallback_exe_candidates(
         }
         let root = format!("{letter}:");
         if let Some(user) = user {
-            push_win_dir(&[
-                &root,
-                "Users",
-                user,
-                "AppData",
-                "Local",
-                "Programs",
-                "WorkBuddy",
-            ]);
-            push_win_dir(&[
-                &root,
-                "Users",
-                user,
-                "AppData",
-                "Local",
-                "Programs",
-                "CodeBuddy",
-            ]);
+            for dir in variant.windows_image_names() {
+                push_win_dir(&[&root, "Users", user, "AppData", "Local", "Programs", dir]);
+            }
         }
-        push_win_dir(&[&root, "Program Files", "WorkBuddy"]);
-        push_win_dir(&[&root, "Program Files", "CodeBuddy"]);
+        for dir in variant.windows_image_names() {
+            push_win_dir(&[&root, "Program Files", dir]);
+        }
     }
     out
 }
@@ -291,7 +293,7 @@ pub(crate) fn parse_windows_process_rows(stdout: &str) -> Vec<WindowsProcessRow>
         .collect()
 }
 
-fn keep_windows_workbuddy_row(row: &WindowsProcessRow) -> bool {
+fn keep_windows_workbuddy_row(row: &WindowsProcessRow, variant: WbVariant) -> bool {
     let path_s = row
         .exe_path
         .as_ref()
@@ -304,13 +306,16 @@ fn keep_windows_workbuddy_row(row: &WindowsProcessRow) -> bool {
     if is_crashpad_helper_name(&row.name) || is_crashpad_helper_name(file_name) {
         return false;
     }
-    is_workbuddy_image_name(&row.name) || is_workbuddy_image_name(file_name)
+    is_workbuddy_image_name(&row.name, variant) || is_workbuddy_image_name(file_name, variant)
 }
 
-fn filter_windows_workbuddy_rows(rows: &[WindowsProcessRow]) -> Vec<WindowsProcessRow> {
+fn filter_windows_workbuddy_rows(
+    rows: &[WindowsProcessRow],
+    variant: WbVariant,
+) -> Vec<WindowsProcessRow> {
     let mut out = Vec::new();
     for row in rows {
-        if !keep_windows_workbuddy_row(row) {
+        if !keep_windows_workbuddy_row(row, variant) {
             continue;
         }
         if out.iter().any(|r: &WindowsProcessRow| r.pid == row.pid) {
@@ -321,7 +326,7 @@ fn filter_windows_workbuddy_rows(rows: &[WindowsProcessRow]) -> Vec<WindowsProce
     out
 }
 
-fn parse_windows_registry_path_lines(stdout: &str) -> Vec<PathBuf> {
+fn parse_windows_registry_path_lines(stdout: &str, variant: WbVariant) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let Some(parsed) = parse_windows_display_icon(line) else {
@@ -331,7 +336,7 @@ fn parse_windows_registry_path_lines(stdout: &str) -> Vec<PathBuf> {
         if is_self_image_name(name) {
             continue;
         }
-        if !name.is_empty() && !is_workbuddy_image_name(name) {
+        if !name.is_empty() && !is_workbuddy_image_name(name, variant) {
             continue;
         }
         let pb = PathBuf::from(parsed);
@@ -342,30 +347,30 @@ fn parse_windows_registry_path_lines(stdout: &str) -> Vec<PathBuf> {
     out
 }
 
-/// 路径最后一段必须是 WorkBuddy/CodeBuddy 映像名（忽略 .exe）。
-fn is_workbuddy_exe_file_name(path: &Path) -> bool {
+/// 路径最后一段必须是本档位的 WorkBuddy 映像名（忽略 .exe）。
+fn is_workbuddy_exe_file_name(path: &Path, variant: WbVariant) -> bool {
     let owned = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| image_name_from_path_str(&path.to_string_lossy()).to_string());
-    is_workbuddy_image_name(&owned)
+    is_workbuddy_image_name(&owned, variant)
 }
 
 #[cfg(target_os = "windows")]
-fn is_existing_workbuddy_exe(path: &Path) -> bool {
-    path.is_file() && is_workbuddy_exe_file_name(path)
+fn is_existing_workbuddy_exe(path: &Path, variant: WbVariant) -> bool {
+    path.is_file() && is_workbuddy_exe_file_name(path, variant)
 }
 
 /// 记住已存在的 exe；缓存已是同一路径则不重复写。
 #[cfg(target_os = "windows")]
-fn persist_workbuddy_exe(path: &Path) {
-    if !is_existing_workbuddy_exe(path) {
+fn persist_workbuddy_exe(path: &Path, variant: WbVariant) {
+    if !is_existing_workbuddy_exe(path, variant) {
         return;
     }
-    if config::load_workbuddy_exe_cache().as_deref() == Some(path) {
+    if config::load_workbuddy_exe_cache(variant).as_deref() == Some(path) {
         return;
     }
-    let _ = config::save_workbuddy_exe_cache(path);
+    let _ = config::save_workbuddy_exe_cache(variant, path);
 }
 
 /// Windows：执行 PowerShell 并取 stdout。
@@ -388,14 +393,15 @@ pub(crate) fn windows_tasklist_image_rows(image: &str) -> Vec<WindowsProcessRow>
     parse_tasklist_csv(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// 精确映像名收集 WorkBuddy/CodeBuddy PID，排除本工具、自身 PID 与 crashpad。
+/// 精确映像名收集本档位 WorkBuddy PID，排除本工具、自身 PID 与 crashpad。
 #[cfg(target_os = "windows")]
-fn windows_workbuddy_process_rows() -> Vec<WindowsProcessRow> {
+fn windows_workbuddy_process_rows(variant: WbVariant) -> Vec<WindowsProcessRow> {
     let self_pid = std::process::id();
     let mut rows = Vec::new();
-    rows.extend(windows_tasklist_image_rows("WorkBuddy.exe"));
-    rows.extend(windows_tasklist_image_rows("CodeBuddy.exe"));
-    filter_windows_workbuddy_rows(&rows)
+    for exe in windows_exe_names(variant) {
+        rows.extend(windows_tasklist_image_rows(&exe));
+    }
+    filter_windows_workbuddy_rows(&rows, variant)
         .into_iter()
         .filter(|r| r.pid != self_pid)
         .collect()
@@ -439,13 +445,16 @@ pub(crate) fn existing_windows_drives() -> Vec<char> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_running_workbuddy_exe() -> Option<PathBuf> {
-    let script = "Get-Process -Name WorkBuddy,CodeBuddy -ErrorAction SilentlyContinue | \
-         ForEach-Object { $p = ''; try { $p = $_.Path } catch {}; '{0}|{1}|{2}' -f $_.Id, $_.ProcessName, $p }";
-    let stdout = ps_output(script, 5)?;
-    for row in filter_windows_workbuddy_rows(&parse_windows_process_rows(&stdout)) {
+fn windows_running_workbuddy_exe(variant: WbVariant) -> Option<PathBuf> {
+    let names = variant.windows_image_names().join(",");
+    let script = format!(
+        "Get-Process -Name {names} -ErrorAction SilentlyContinue | \
+         ForEach-Object {{ $p = ''; try {{ $p = $_.Path }} catch {{}}; '{{0}}|{{1}}|{{2}}' -f $_.Id, $_.ProcessName, $p }}"
+    );
+    let stdout = ps_output(&script, 5)?;
+    for row in filter_windows_workbuddy_rows(&parse_windows_process_rows(&stdout), variant) {
         if let Some(p) = row.exe_path {
-            if is_existing_workbuddy_exe(&p) {
+            if is_existing_workbuddy_exe(&p, variant) {
                 return Some(p);
             }
         }
@@ -453,12 +462,12 @@ fn windows_running_workbuddy_exe() -> Option<PathBuf> {
     None
 }
 
-#[cfg(target_os = "windows")]
-fn windows_registry_exe_candidates() -> Vec<PathBuf> {
-    let script = r#"
+/// 注册表探测脚本模板：`__APP_EXE_NAMES__` 替换为 `'X.exe','Y.exe'`，
+/// `__DISPLAY_MATCH__` 替换为本档位映像名正则（Uninstall 项过滤）。
+const WINDOWS_REGISTRY_PROBE_TEMPLATE: &str = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 $out = @()
-$appNames = @('WorkBuddy.exe','CodeBuddy.exe')
+$appNames = @(__APP_EXE_NAMES__)
 $appHives = @(
   'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths',
   'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths',
@@ -486,22 +495,38 @@ foreach ($hive in $unHives) {
     if (-not $dn) { return }
     $dnl = [string]$dn
     if ($dnl -match 'workbuddy-switch|wb-switch') { return }
-    if ($dnl -notmatch 'WorkBuddy|CodeBuddy') { return }
+    if ($dnl -notmatch '__DISPLAY_MATCH__') { return }
     $icon = $_.GetValue('DisplayIcon')
     if ($icon) { $out += [string]$icon }
     $loc = $_.GetValue('InstallLocation')
     if ($loc) {
-      $out += [string](Join-Path $loc 'WorkBuddy.exe')
-      $out += [string](Join-Path $loc 'CodeBuddy.exe')
+      foreach ($e in @(__APP_EXE_NAMES__)) { $out += [string](Join-Path $loc $e) }
     }
   }
 }
 $out | ForEach-Object { $_ }
 "#;
-    let Some(stdout) = ps_output(script, 8) else {
+
+/// 注册表探测脚本（App Paths + Uninstall，含 WOW6432Node）。
+/// 按档位替换映像名与 DisplayName 匹配模式，避免跨档位互相发现。
+fn windows_registry_probe_script(variant: WbVariant) -> String {
+    let quoted_exes: Vec<String> = windows_exe_names(variant)
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect();
+    let app_names = quoted_exes.join(",");
+    let display_match = variant.windows_image_names().join("|");
+    WINDOWS_REGISTRY_PROBE_TEMPLATE
+        .replace("__APP_EXE_NAMES__", &app_names)
+        .replace("__DISPLAY_MATCH__", &display_match)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_registry_exe_candidates(variant: WbVariant) -> Vec<PathBuf> {
+    let Some(stdout) = ps_output(&windows_registry_probe_script(variant), 8) else {
         return Vec::new();
     };
-    parse_windows_registry_path_lines(&stdout)
+    parse_windows_registry_path_lines(&stdout, variant)
 }
 
 /// Windows：动态查找 WorkBuddy 可执行文件路径。
@@ -510,22 +535,22 @@ $out | ForEach-Object { $_ }
 /// （含 WOW6432Node、DisplayIcon）→ LOCALAPPDATA/Program Files 与各盘符常见目录。
 /// 命中且文件存在则写入缓存；缓存指向丢失文件则丢弃。
 #[cfg(target_os = "windows")]
-pub fn windows_workbuddy_exe_path() -> Option<PathBuf> {
-    if let Some(p) = windows_running_workbuddy_exe() {
-        persist_workbuddy_exe(&p);
+pub fn windows_workbuddy_exe_path(variant: WbVariant) -> Option<PathBuf> {
+    if let Some(p) = windows_running_workbuddy_exe(variant) {
+        persist_workbuddy_exe(&p, variant);
         return Some(p);
     }
 
-    if let Some(cached) = config::load_workbuddy_exe_cache() {
-        if is_existing_workbuddy_exe(&cached) {
+    if let Some(cached) = config::load_workbuddy_exe_cache(variant) {
+        if is_existing_workbuddy_exe(&cached, variant) {
             return Some(cached);
         }
-        config::clear_workbuddy_exe_cache();
+        config::clear_workbuddy_exe_cache(variant);
     }
 
-    for p in windows_registry_exe_candidates() {
-        if is_existing_workbuddy_exe(&p) {
-            persist_workbuddy_exe(&p);
+    for p in windows_registry_exe_candidates(variant) {
+        if is_existing_workbuddy_exe(&p, variant) {
+            persist_workbuddy_exe(&p, variant);
             return Some(p);
         }
     }
@@ -541,14 +566,23 @@ pub fn windows_workbuddy_exe_path() -> Option<PathBuf> {
         pf86.as_deref(),
         user.as_deref(),
         &drives,
+        variant,
     );
     for p in candidates {
-        if is_existing_workbuddy_exe(&p) {
-            persist_workbuddy_exe(&p);
+        if is_existing_workbuddy_exe(&p, variant) {
+            persist_workbuddy_exe(&p, variant);
             return Some(p);
         }
     }
     None
+}
+
+/// Windows 默认安装路径（探测全失败时的回落，供启动失败文案写出尝试路径）。
+#[cfg(target_os = "windows")]
+pub fn windows_default_app_path(variant: WbVariant) -> PathBuf {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let dir = variant.windows_image_names()[0];
+    windows_path(&[&local, "Programs", dir, &format!("{dir}.exe")])
 }
 
 // ---------------------------------------------------------------------------
@@ -566,25 +600,11 @@ pub fn windows_workbuddy_exe_path() -> Option<PathBuf> {
 // - 包内清杀只按 PID 枚举后 `kill -9 <pid>...` 批量，不按名称子串匹配。
 // ---------------------------------------------------------------------------
 
-/// 优雅退出用的目标 bundle id（实测正确 id；曾用/错误 id 不是它）。
+/// 优雅退出用的目标 bundle id（按档位；实测正确 id，曾用/错误 id 不是它）。
 #[cfg(target_os = "macos")]
-const MACOS_QUIT_BUNDLE_ID: &str = "com.tencent.workbuddy.mac";
-
-/// 主进程层字面量回退（路径探测失败时使用）。
-#[cfg(target_os = "macos")]
-const MACOS_MAIN_LITERAL_SUFFIXES: [&str; 2] = [
-    "WorkBuddy.app/Contents/MacOS",
-    "CodeBuddy.app/Contents/MacOS",
-];
-
-/// 包内层字面量回退（含全小写变体，防用户把 .app 目录改名为小写）。
-#[cfg(target_os = "macos")]
-const MACOS_BUNDLE_LITERAL_NAMES: [&str; 4] = [
-    "WorkBuddy.app",
-    "CodeBuddy.app",
-    "workbuddy.app",
-    "codebuddy.app",
-];
+fn macos_quit_bundle_id(variant: WbVariant) -> &'static str {
+    variant.macos_bundle_id()
+}
 
 /// 解析单行 `ps -axo pid=,args=` 输出为 (pid, args)。
 /// ps 输出 pid 列无表头、可能带前导空格，args 保留原始大小写。
@@ -615,7 +635,11 @@ fn ps_row_matches_any(args: &str, patterns: &[String]) -> bool {
 /// 结果按 pid 去重。残留误杀面仅剩「用户进程的 args 主动引用目标 .app 路径」
 /// 这一刻意场景（对齐 Windows 契约记录的残余风险）。
 #[cfg(target_os = "macos")]
-pub(crate) fn filter_ps_rows(stdout: &str, patterns: &[String], self_pid: u32) -> Vec<(u32, String)> {
+pub(crate) fn filter_ps_rows(
+    stdout: &str,
+    patterns: &[String],
+    self_pid: u32,
+) -> Vec<(u32, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for line in stdout.lines() {
@@ -639,27 +663,29 @@ pub(crate) fn filter_ps_rows(stdout: &str, patterns: &[String], self_pid: u32) -
 }
 
 /// 主进程层匹配模式：解析到 app 路径时用 `<app>/Contents/MacOS`；
-/// 探测失败回退字面量（含 CodeBuddy 变体）。纯函数。
+/// 探测失败回退本档位字面量。纯函数。
 #[cfg(target_os = "macos")]
-fn macos_main_patterns(resolved_app: Option<&Path>) -> Vec<String> {
+fn macos_main_patterns(resolved_app: Option<&Path>, variant: WbVariant) -> Vec<String> {
     match resolved_app {
         Some(app) => vec![format!("{}/Contents/MacOS", app.display())],
-        None => MACOS_MAIN_LITERAL_SUFFIXES
+        None => variant
+            .macos_app_names()
             .iter()
-            .map(|s| s.to_string())
+            .map(|name| format!("{name}/Contents/MacOS"))
             .collect(),
     }
 }
 
 /// 包内层匹配模式：解析到 app 路径时用其完整路径；探测失败回退字面量
-/// （WorkBuddy/CodeBuddy 及全小写变体）。纯函数。
+/// （本档位主名 + 全小写变体，防用户把 .app 目录改名）。纯函数。
 #[cfg(target_os = "macos")]
-fn macos_bundle_patterns(resolved_app: Option<&Path>) -> Vec<String> {
+fn macos_bundle_patterns(resolved_app: Option<&Path>, variant: WbVariant) -> Vec<String> {
     match resolved_app {
         Some(app) => vec![app.display().to_string()],
-        None => MACOS_BUNDLE_LITERAL_NAMES
+        None => variant
+            .macos_app_names()
             .iter()
-            .map(|s| s.to_string())
+            .flat_map(|name| [(*name).to_string(), name.to_lowercase()])
             .collect(),
     }
 }
@@ -707,15 +733,15 @@ pub(crate) fn is_app_bundle(path: &Path) -> bool {
     path.is_dir() && path.join("Contents").join("Info.plist").is_file()
 }
 
-/// 常见安装位置候选：/Applications、~/Applications × WorkBuddy/CodeBuddy。
+/// 常见安装位置候选：/Applications、~/Applications × 本档位 app 名。
 /// 纯函数（不访问文件系统），供探测与单测复用。
 #[cfg(target_os = "macos")]
-fn app_bundle_candidates(home: &Path) -> Vec<PathBuf> {
+fn app_bundle_candidates(home: &Path, variant: WbVariant) -> Vec<PathBuf> {
     let home_apps = home.join("Applications");
     let bases = [Path::new("/Applications"), home_apps.as_path()];
     let mut out = Vec::new();
     for base in bases {
-        for name in ["WorkBuddy.app", "CodeBuddy.app"] {
+        for name in variant.macos_app_names() {
             let p = base.join(name);
             if !out.contains(&p) {
                 out.push(p);
@@ -727,20 +753,20 @@ fn app_bundle_candidates(home: &Path) -> Vec<PathBuf> {
 
 /// 命中即写缓存；已是同一路径则不重复写（mac 判 app bundle 目录）。
 #[cfg(target_os = "macos")]
-fn persist_macos_app_cache(path: &Path) {
+fn persist_macos_app_cache(path: &Path, variant: WbVariant) {
     if !is_app_bundle(path) {
         return;
     }
-    if config::load_workbuddy_exe_cache().as_deref() == Some(path) {
+    if config::load_workbuddy_exe_cache(variant).as_deref() == Some(path) {
         return;
     }
-    let _ = config::save_workbuddy_exe_cache(path);
+    let _ = config::save_workbuddy_exe_cache(variant, path);
 }
 
 /// 运行中主进程路径探测：扫主进程层字面量命中行，提取 `.app` 并校验为 bundle。
 #[cfg(target_os = "macos")]
-fn macos_running_app_path() -> Option<PathBuf> {
-    let patterns = macos_main_patterns(None);
+fn macos_running_app_path(variant: WbVariant) -> Option<PathBuf> {
+    let patterns = macos_main_patterns(None, variant);
     for (_pid, args) in macos_rows_by_patterns(&patterns) {
         if let Some(p) = extract_app_bundle_from_args(&args) {
             if is_app_bundle(&p) {
@@ -753,8 +779,11 @@ fn macos_running_app_path() -> Option<PathBuf> {
 
 /// mdfind 按 bundle id 探测应用路径（Spotlight 不可用/未命中则静默跳过）。
 #[cfg(target_os = "macos")]
-fn macos_mdfind_app_path() -> Option<PathBuf> {
-    let query = format!("kMDItemCFBundleIdentifier == '{}'c", MACOS_QUIT_BUNDLE_ID);
+fn macos_mdfind_app_path(variant: WbVariant) -> Option<PathBuf> {
+    let query = format!(
+        "kMDItemCFBundleIdentifier == '{}'c",
+        macos_quit_bundle_id(variant)
+    );
     let out = run_cmd_timeout("mdfind", &[query.as_str()], 5)?;
     if !out.status.success() {
         return None;
@@ -770,43 +799,42 @@ fn macos_mdfind_app_path() -> Option<PathBuf> {
 /// macOS app 路径动态探测（对齐 Windows 契约风格）。
 ///
 /// 顺序：运行中主进程 → 缓存（mac 判 app bundle 目录）→ 常见位置
-/// （/Applications、~/Applications × WorkBuddy/CodeBuddy）→ mdfind bundle id。
+/// （/Applications、~/Applications × 本档位 app 名）→ mdfind bundle id。
 /// 命中即写缓存；缓存指向已不存在的 bundle 则丢弃并继续。
 /// 全部失败返回 None，由调用方决定默认路径 / 字面量回退。
 #[cfg(target_os = "macos")]
-fn macos_workbuddy_app_path_resolved() -> Option<PathBuf> {
-    if let Some(p) = macos_running_app_path() {
-        persist_macos_app_cache(&p);
+fn macos_workbuddy_app_path_resolved(variant: WbVariant) -> Option<PathBuf> {
+    if let Some(p) = macos_running_app_path(variant) {
+        persist_macos_app_cache(&p, variant);
         return Some(p);
     }
-    if let Some(cached) = config::load_workbuddy_exe_cache() {
+    if let Some(cached) = config::load_workbuddy_exe_cache(variant) {
         if is_app_bundle(&cached) {
             return Some(cached);
         }
-        config::clear_workbuddy_exe_cache();
+        config::clear_workbuddy_exe_cache(variant);
     }
     let home = config::home_dir();
-    for p in app_bundle_candidates(&home) {
+    for p in app_bundle_candidates(&home, variant) {
         if is_app_bundle(&p) {
-            persist_macos_app_cache(&p);
+            persist_macos_app_cache(&p, variant);
             return Some(p);
         }
     }
-    if let Some(p) = macos_mdfind_app_path() {
+    if let Some(p) = macos_mdfind_app_path(variant) {
         if is_app_bundle(&p) {
-            persist_macos_app_cache(&p);
+            persist_macos_app_cache(&p, variant);
             return Some(p);
         }
     }
     None
 }
 
-/// macOS：解析 WorkBuddy app 路径；全部失败回退默认 `/Applications/WorkBuddy.app`
+/// macOS：解析 WorkBuddy app 路径；全部失败回退本档位默认 app
 /// （供启动失败文案与包模式回退使用，与改造前的默认值等价）。
 #[cfg(target_os = "macos")]
-pub fn macos_workbuddy_app_path() -> PathBuf {
-    macos_workbuddy_app_path_resolved()
-        .unwrap_or_else(|| PathBuf::from("/Applications/WorkBuddy.app"))
+pub fn macos_workbuddy_app_path(variant: WbVariant) -> PathBuf {
+    macos_workbuddy_app_path_resolved(variant).unwrap_or_else(|| variant.macos_default_app_path())
 }
 
 /// `kill -9` 按 PID 批量强杀；不按字符串匹配。失败仅打日志。
@@ -863,16 +891,20 @@ pub(crate) fn wait_macos_main_gone(main_patterns: &[String], timeout: Duration) 
 ///
 /// 注意：**不**以「主进程不在」做早退 —— 仅守护子进程存活的场景必须执行清杀。
 #[cfg(target_os = "macos")]
-fn close_workbuddy_macos(timeout_secs: i64) -> Result<(), String> {
+fn close_workbuddy_macos(variant: WbVariant, timeout_secs: i64) -> Result<(), String> {
     let started = Instant::now();
     let timeout = Duration::from_secs(timeout_secs.max(1) as u64);
-    let resolved = macos_workbuddy_app_path_resolved();
-    let main_patterns = macos_main_patterns(resolved.as_deref());
-    let bundle_patterns = macos_bundle_patterns(resolved.as_deref());
-    let remaining = || timeout.saturating_sub(started.elapsed()).max(Duration::from_millis(100));
+    let resolved = macos_workbuddy_app_path_resolved(variant);
+    let main_patterns = macos_main_patterns(resolved.as_deref(), variant);
+    let bundle_patterns = macos_bundle_patterns(resolved.as_deref(), variant);
+    let remaining = || {
+        timeout
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(100))
+    };
 
     // 1) 优雅退出
-    let quit_script = format!("quit app id \"{MACOS_QUIT_BUNDLE_ID}\"");
+    let quit_script = format!("quit app id \"{}\"", macos_quit_bundle_id(variant));
     let quit = run_cmd_timeout("osascript", &["-e", quit_script.as_str()], 10);
     match quit {
         Some(out) if !out.status.success() => {
@@ -919,13 +951,17 @@ fn close_workbuddy_macos(timeout_secs: i64) -> Result<(), String> {
 ///
 /// progress 可选：出现/确认阶段推送心跳，避免"正在启动…"长时间静默被误判卡死。
 #[cfg(target_os = "macos")]
-fn validate_macos_startup(app: &Path, progress: Option<&dyn Fn(&str)>) -> Result<(), String> {
+fn validate_macos_startup(
+    app: &Path,
+    variant: WbVariant,
+    progress: Option<&dyn Fn(&str)>,
+) -> Result<(), String> {
     let say = |msg: &str| {
         if let Some(p) = progress {
             p(msg);
         }
     };
-    let main_patterns = macos_main_patterns(Some(app));
+    let main_patterns = macos_main_patterns(Some(app), variant);
     let deadline = Instant::now() + Duration::from_secs(30);
     let sustain = Duration::from_secs(10);
     let beat_every = Duration::from_secs(2);
@@ -954,10 +990,7 @@ fn validate_macos_startup(app: &Path, progress: Option<&dyn Fn(&str)>) -> Result
                             .unwrap_or(true);
                     if due {
                         last_beat = Some(now);
-                        say(&format!(
-                            "已稳定运行 {}s / 10s…",
-                            since_seen.as_secs()
-                        ));
+                        say(&format!("已稳定运行 {}s / 10s…", since_seen.as_secs()));
                     }
                 }
             }
@@ -980,13 +1013,16 @@ fn validate_macos_startup(app: &Path, progress: Option<&dyn Fn(&str)>) -> Result
 ///
 /// progress 可选：清杀/启动/存活确认阶段推送心跳（见 `validate_macos_startup`）。
 #[cfg(target_os = "macos")]
-fn launch_workbuddy_macos(progress: Option<&dyn Fn(&str)>) -> Result<(), String> {
+fn launch_workbuddy_macos(
+    variant: WbVariant,
+    progress: Option<&dyn Fn(&str)>,
+) -> Result<(), String> {
     let say = |msg: &str| {
         if let Some(p) = progress {
             p(msg);
         }
     };
-    let app = macos_workbuddy_app_path();
+    let app = macos_workbuddy_app_path(variant);
     if !is_app_bundle(&app) {
         return Err(format!(
             "未找到 WorkBuddy 应用（尝试路径: {}）。请先手动打开一次 WorkBuddy 后重试。",
@@ -995,7 +1031,7 @@ fn launch_workbuddy_macos(progress: Option<&dyn Fn(&str)>) -> Result<(), String>
     }
 
     // 保险清杀：包内残留（如持锁守护）非空则 kill -9 全部并等到空（5s）。
-    let bundle_patterns = macos_bundle_patterns(Some(&app));
+    let bundle_patterns = macos_bundle_patterns(Some(&app), variant);
     let bundle_pids = macos_pids_by_patterns(&bundle_patterns);
     if !bundle_pids.is_empty() {
         say("正在清理残留进程…");
@@ -1016,7 +1052,10 @@ fn launch_workbuddy_macos(progress: Option<&dyn Fn(&str)>) -> Result<(), String>
             } else {
                 reason
             };
-            return Err(format!("启动 WorkBuddy 失败: {reason}（路径: {}）", app.display()));
+            return Err(format!(
+                "启动 WorkBuddy 失败: {reason}（路径: {}）",
+                app.display()
+            ));
         }
         None => {
             return Err(format!(
@@ -1026,26 +1065,27 @@ fn launch_workbuddy_macos(progress: Option<&dyn Fn(&str)>) -> Result<(), String>
         }
     }
 
-    validate_macos_startup(&app, progress)
+    validate_macos_startup(&app, variant, progress)
 }
 
-/// WorkBuddy 是否在运行。
-pub fn is_workbuddy_running() -> bool {
+/// WorkBuddy 是否在运行（按档位判定，两档位互不命中）。
+pub fn is_workbuddy_running(variant: WbVariant) -> bool {
     #[cfg(target_os = "macos")]
     {
         // footer 语义 = GUI 主进程在运行：仅包内守护子进程存活不算运行中。
         // 使用解析出的主进程模式，解析失败回退字面量。
-        let resolved = macos_workbuddy_app_path_resolved();
-        let patterns = macos_main_patterns(resolved.as_deref());
+        let resolved = macos_workbuddy_app_path_resolved(variant);
+        let patterns = macos_main_patterns(resolved.as_deref(), variant);
         !macos_pids_by_patterns(&patterns).is_empty()
     }
     #[cfg(target_os = "windows")]
     {
-        !windows_workbuddy_process_rows().is_empty()
+        !windows_workbuddy_process_rows(variant).is_empty()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        match cmd_builder("pgrep").args(["-f", "workbuddy"]).output() {
+        let pattern = variant.linux_process_pattern();
+        match cmd_builder("pgrep").args(["-f", pattern]).output() {
             Ok(out) => out.status.success() && !out.stdout.is_empty(),
             Err(_) => false,
         }
@@ -1053,48 +1093,49 @@ pub fn is_workbuddy_running() -> bool {
 }
 
 /// 轮询等待 WorkBuddy 进程全部退出，返回是否已退出。对照 `_wait_process_gone`。
-pub fn wait_process_gone(timeout_secs: f64) -> bool {
+pub fn wait_process_gone(variant: WbVariant, timeout_secs: f64) -> bool {
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
     while Instant::now() < deadline {
-        if !is_workbuddy_running() {
+        if !is_workbuddy_running(variant) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    !is_workbuddy_running()
+    !is_workbuddy_running(variant)
 }
 
 /// 关闭 WorkBuddy：优雅退出 → 超时后强杀 → 确认进程消失。对照 `close_workbuddy`。
-pub fn close_workbuddy(timeout_secs: i64) -> Result<(), String> {
+pub fn close_workbuddy(variant: WbVariant, timeout_secs: i64) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        close_workbuddy_windows(timeout_secs)
+        close_workbuddy_windows(variant, timeout_secs)
     }
     #[cfg(target_os = "macos")]
     {
-        close_workbuddy_macos(timeout_secs)
+        close_workbuddy_macos(variant, timeout_secs)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        if !is_workbuddy_running() {
+        if !is_workbuddy_running(variant) {
             return Ok(());
         }
-        let _ = run_cmd_timeout("pkill", &["-15", "-f", "workbuddy"], 10);
-        if wait_process_gone((timeout_secs.min(5)) as f64) {
+        let pattern = variant.linux_process_pattern();
+        let _ = run_cmd_timeout("pkill", &["-15", "-f", pattern], 10);
+        if wait_process_gone(variant, (timeout_secs.min(5)) as f64) {
             return Ok(());
         }
-        let _ = run_cmd_timeout("pkill", &["-9", "-f", "workbuddy"], 10);
-        if wait_process_gone(timeout_secs as f64) {
+        let _ = run_cmd_timeout("pkill", &["-9", "-f", pattern], 10);
+        if wait_process_gone(variant, timeout_secs as f64) {
             return Ok(());
         }
-        return Err("WorkBuddy 进程无法关闭，请手动结束 workbuddy 进程".to_string());
+        Err("WorkBuddy 进程无法关闭，请手动结束 workbuddy 进程".to_string())
     }
 }
 
 /// 先对目标 PID `taskkill /PID /T`（无 /F），超时再 `/F`；按 PID 等待，不按名称子串。
 #[cfg(target_os = "windows")]
-fn close_workbuddy_windows(timeout_secs: i64) -> Result<(), String> {
-    let rows = windows_workbuddy_process_rows();
+fn close_workbuddy_windows(variant: WbVariant, timeout_secs: i64) -> Result<(), String> {
+    let rows = windows_workbuddy_process_rows(variant);
     if rows.is_empty() {
         return Ok(());
     }
@@ -1130,25 +1171,26 @@ fn close_workbuddy_windows(timeout_secs: i64) -> Result<(), String> {
 ///
 /// progress 可选：macOS 启动与存活确认阶段推送心跳（避免界面长时间静默）；
 /// Windows/Linux 分支忽略该参数。
-pub fn launch_workbuddy(progress: Option<&dyn Fn(&str)>) -> Result<(), String> {
+pub fn launch_workbuddy(variant: WbVariant, progress: Option<&dyn Fn(&str)>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        launch_workbuddy_macos(progress)
+        launch_workbuddy_macos(variant, progress)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = progress;
-        let app = auth_file::workbuddy_app_path();
+        let app = auth_file::workbuddy_app_path(variant);
         #[cfg(target_os = "windows")]
         {
+            let default_exe = windows_exe_names(variant)[0].clone();
             let exe = if app
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
             {
                 app.clone()
             } else {
-                app.join("WorkBuddy.exe")
+                app.join(default_exe)
             };
             if !exe.exists() {
                 return Err(format!(
@@ -1156,7 +1198,7 @@ pub fn launch_workbuddy(progress: Option<&dyn Fn(&str)>) -> Result<(), String> {
                     exe.display()
                 ));
             }
-            persist_workbuddy_exe(&exe);
+            persist_workbuddy_exe(&exe, variant);
             cmd_builder(&exe)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1193,22 +1235,110 @@ mod tests {
 
     #[test]
     fn workbuddy_image_name_is_exact_not_substring() {
-        assert!(is_workbuddy_image_name("WorkBuddy.exe"));
-        assert!(is_workbuddy_image_name("workbuddy"));
-        assert!(is_workbuddy_image_name("CodeBuddy.exe"));
-        assert!(is_workbuddy_image_name("CODEBUDDY"));
-        assert!(!is_workbuddy_image_name("workbuddy-switch.exe"));
-        assert!(!is_workbuddy_image_name("wb-switch"));
-        assert!(!is_workbuddy_image_name("WorkBuddy Helper.exe"));
-        assert!(!is_workbuddy_image_name("MyWorkBuddy.exe"));
-        assert!(is_workbuddy_exe_file_name(Path::new("WorkBuddy.exe")));
-        assert!(is_workbuddy_exe_file_name(Path::new(
-            r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe"
-        )));
-        assert!(!is_workbuddy_exe_file_name(Path::new(
-            "workbuddy-switch.exe"
-        )));
-        assert!(!is_workbuddy_exe_file_name(Path::new("Uninstall.exe")));
+        assert!(is_workbuddy_image_name("WorkBuddy.exe", WbVariant::Cn));
+        assert!(is_workbuddy_image_name("workbuddy", WbVariant::Cn));
+        assert!(!is_workbuddy_image_name("CodeBuddy.exe", WbVariant::Cn));
+        assert!(!is_workbuddy_image_name("CODEBUDDY", WbVariant::Cn));
+        assert!(!is_workbuddy_image_name(
+            "workbuddy-switch.exe",
+            WbVariant::Cn
+        ));
+        assert!(!is_workbuddy_image_name("wb-switch", WbVariant::Cn));
+        assert!(!is_workbuddy_image_name(
+            "WorkBuddy Helper.exe",
+            WbVariant::Cn
+        ));
+        assert!(!is_workbuddy_image_name("MyWorkBuddy.exe", WbVariant::Cn));
+        assert!(is_workbuddy_exe_file_name(
+            Path::new("WorkBuddy.exe"),
+            WbVariant::Cn
+        ));
+        assert!(is_workbuddy_exe_file_name(
+            Path::new(r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe"),
+            WbVariant::Cn
+        ));
+        assert!(!is_workbuddy_exe_file_name(
+            Path::new("workbuddy-switch.exe"),
+            WbVariant::Cn
+        ));
+        assert!(!is_workbuddy_exe_file_name(
+            Path::new("Uninstall.exe"),
+            WbVariant::Cn
+        ));
+    }
+
+    /// 两档位映像名必须互斥：跨档位命中会误杀另一版客户端。
+    #[test]
+    fn variant_image_names_never_cross_match() {
+        assert!(is_workbuddy_image_name("WorkBuddyAI.exe", WbVariant::Ai));
+        assert!(is_workbuddy_image_name("workbuddyai", WbVariant::Ai));
+        assert!(
+            !is_workbuddy_image_name("WorkBuddy.exe", WbVariant::Ai),
+            "国内版主程序不得命中国际版判定"
+        );
+        assert!(!is_workbuddy_image_name("CodeBuddy.exe", WbVariant::Ai));
+
+        assert!(
+            !is_workbuddy_image_name("WorkBuddyAI.exe", WbVariant::Cn),
+            "国际版主程序不得命中国内版判定"
+        );
+        assert!(!is_workbuddy_image_name("workbuddyai", WbVariant::Cn));
+
+        for variant in WbVariant::ALL {
+            for name in [
+                "workbuddy-switch.exe",
+                "wb-switch",
+                "WB-SWITCH.EXE",
+                "WorkBuddySwitch.exe",
+            ] {
+                assert!(
+                    !is_workbuddy_image_name(name, variant),
+                    "{name} 不得命中 {variant:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            windows_exe_names(WbVariant::Ai),
+            vec!["WorkBuddyAI.exe".to_string()]
+        );
+        assert_eq!(
+            windows_exe_names(WbVariant::Cn),
+            vec!["WorkBuddy.exe".to_string()]
+        );
+    }
+
+    #[test]
+    fn ai_process_rows_do_not_swallow_cn_processes() {
+        let stdout = "\
+1001|WorkBuddyAI|D:\\Users\\Zhou\\AppData\\Local\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe
+1002|WorkBuddy|D:\\Users\\Zhou\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe
+1003|workbuddy-switch|C:\\apps\\workbuddy-switch.exe
+";
+        let rows = parse_windows_process_rows(stdout);
+        let ai: Vec<u32> = filter_windows_workbuddy_rows(&rows, WbVariant::Ai)
+            .iter()
+            .map(|r| r.pid)
+            .collect();
+        let cn: Vec<u32> = filter_windows_workbuddy_rows(&rows, WbVariant::Cn)
+            .iter()
+            .map(|r| r.pid)
+            .collect();
+        assert_eq!(ai, vec![1001]);
+        assert_eq!(cn, vec![1002]);
+    }
+
+    #[test]
+    fn registry_probe_script_is_variant_scoped() {
+        let ai = windows_registry_probe_script(WbVariant::Ai);
+        assert!(ai.contains("@('WorkBuddyAI.exe')"));
+        assert!(ai.contains("-notmatch 'WorkBuddyAI'"));
+        assert!(ai.contains("workbuddy-switch|wb-switch"), "自排除保留");
+
+        let cn = windows_registry_probe_script(WbVariant::Cn);
+        assert!(cn.contains("@('WorkBuddy.exe')"));
+        assert!(cn.contains("-notmatch 'WorkBuddy'"));
+        assert!(!cn.contains("CodeBuddy.exe"));
     }
 
     #[test]
@@ -1240,6 +1370,7 @@ mod tests {
             Some(r"C:\Program Files (x86)"),
             Some("Zhou"),
             &['C', 'D'],
+            WbVariant::Cn,
         );
         let want = r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe";
         assert!(
@@ -1259,6 +1390,32 @@ mod tests {
     }
 
     #[test]
+    fn ai_fallback_candidates_stay_within_variant() {
+        let cands = windows_fallback_exe_candidates(
+            Some(r"C:\Users\Zhou\AppData\Local"),
+            None,
+            None,
+            Some("Zhou"),
+            &['D'],
+            WbVariant::Ai,
+        );
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            s.contains(
+                &r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddyAI\WorkBuddyAI.exe".to_string()
+            ),
+            "missing AI candidate in {s:?}"
+        );
+        assert!(
+            s.iter().all(|p| !p.contains("WorkBuddy.exe")),
+            "国际版候选不得出现国内版程序名: {s:?}"
+        );
+    }
+
+    #[test]
     fn process_rows_drop_self_and_crashpad() {
         let stdout = "\
 1001|workbuddy-switch|C:\\apps\\workbuddy-switch.exe
@@ -1268,22 +1425,28 @@ mod tests {
 1005|CodeBuddy|
 1006|WorkBuddy Helper|
 ";
-        let kept = filter_windows_workbuddy_rows(&parse_windows_process_rows(stdout));
+        let kept =
+            filter_windows_workbuddy_rows(&parse_windows_process_rows(stdout), WbVariant::Cn);
         let pids: Vec<u32> = kept.iter().map(|r| r.pid).collect();
-        assert_eq!(pids, vec![1003, 1005]);
+        assert_eq!(pids, vec![1003]);
     }
 
     #[test]
     fn only_switcher_process_is_not_workbuddy_running() {
         let stdout = "4400|workbuddy-switch.exe|C:\\Users\\Zhou\\AppData\\Local\\Programs\\wb-switch\\workbuddy-switch.exe\n";
-        let kept = filter_windows_workbuddy_rows(&parse_windows_process_rows(stdout));
+        let kept =
+            filter_windows_workbuddy_rows(&parse_windows_process_rows(stdout), WbVariant::Cn);
         assert!(kept.is_empty());
+        assert!(
+            filter_windows_workbuddy_rows(&parse_windows_process_rows(stdout), WbVariant::Ai)
+                .is_empty()
+        );
 
         let csv = "\
 \"workbuddy-switch.exe\",\"4400\",\"Console\",\"1\",\"10,000 K\"
 \"wb-switch.exe\",\"4401\",\"Console\",\"1\",\"8,000 K\"
 ";
-        let kept = filter_windows_workbuddy_rows(&parse_tasklist_csv(csv));
+        let kept = filter_windows_workbuddy_rows(&parse_tasklist_csv(csv), WbVariant::Cn);
         assert!(kept.is_empty());
     }
 
@@ -1294,7 +1457,7 @@ mod tests {
 \"workbuddy-switch.exe\",\"4400\",\"Console\",\"1\",\"10,000 K\"
 INFO: No tasks are running which match the specified criteria.
 ";
-        let kept = filter_windows_workbuddy_rows(&parse_tasklist_csv(csv));
+        let kept = filter_windows_workbuddy_rows(&parse_tasklist_csv(csv), WbVariant::Cn);
         assert_eq!(kept.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![1234]);
     }
 
@@ -1306,7 +1469,7 @@ C:\Users\Zhou\AppData\Local\Programs\workbuddy-switch\workbuddy-switch.exe
 D:\Program Files\WorkBuddy\Uninstall.exe
 D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
 "#;
-        let paths = parse_windows_registry_path_lines(stdout);
+        let paths = parse_windows_registry_path_lines(stdout, WbVariant::Cn);
         let s: Vec<String> = paths
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
@@ -1315,6 +1478,362 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
             s,
             vec![r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe".to_string(),]
         );
+        assert!(parse_windows_registry_path_lines(stdout, WbVariant::Ai).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Windows 注册表探测：合成 HKCU 项（windows-latest 真机取证）
+    //
+    // 本机是 macOS，注册表 + PowerShell 这条链路只能在 Windows 上运行验证。
+    // 只调用候选层 `windows_registry_exe_candidates`，不碰
+    // `windows_workbuddy_exe_path`（后者会写 ~/.wb-switch 缓存、污染开发机）。
+    // Uninstall 子键带 pid，写入前先删同名键。App Paths 必须用真实 exe 名
+    // （探测脚本按这个名字查找），不是 pid 键；覆盖前先读出原默认值，清理时写回。
+    // 夹具 Drop 无条件清理（断言 panic 也会执行）。
+    // ------------------------------------------------------------------
+
+    #[cfg(target_os = "windows")]
+    const TEST_UNINSTALL_ROOT: &str = r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+    #[cfg(target_os = "windows")]
+    const TEST_APP_PATHS_ROOT: &str = r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
+
+    /// 本组用例每个都要多次启动 PowerShell/reg.exe；CI（windows-latest）上并发
+    /// 启动会互相挤占，曾出现 8s/15s 超时的假失败（同代码重跑即过）。与
+    /// cli_auth_sync_e2e 的 ENV_LOCK 同一思路：组内用例串行执行。
+    #[cfg(target_os = "windows")]
+    static REGISTRY_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 执行 reg.exe（best-effort，清理路径用：失败不 panic）。
+    #[cfg(target_os = "windows")]
+    fn reg_try(args: &[&str]) {
+        let _ = run_cmd_timeout("reg.exe", args, 15);
+    }
+
+    /// 执行 reg.exe 并断言成功（写入路径用）。
+    #[cfg(target_os = "windows")]
+    fn reg_run(args: &[&str]) {
+        let out = run_cmd_timeout("reg.exe", args, 15).expect("reg.exe 未能启动或超时");
+        assert!(
+            out.status.success(),
+            "reg {args:?} 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn app_paths_key(exe_name: &str) -> String {
+        format!(r"{TEST_APP_PATHS_ROOT}\{exe_name}")
+    }
+
+    /// 读取 App Paths 默认值，供清理时恢复。
+    ///
+    /// 键不存在或默认值为空 → `None`（后续可以新建）。
+    /// powershell 没启动或超时则 panic：不能把读取失败当成「没有原值」再删键。
+    #[cfg(target_os = "windows")]
+    fn read_app_paths_default(exe_name: &str) -> Option<String> {
+        let script = format!(
+            "$ErrorActionPreference = 'SilentlyContinue'; \
+             $p = Get-ItemProperty -LiteralPath 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{exe_name}'; \
+             if ($null -eq $p) {{ 'MISSING' }} \
+             elseif ($null -eq $p.'(default)' -or [string]$p.'(default)' -eq '') {{ 'NODEFAULT' }} \
+             else {{ 'VALUE:' + [string]$p.'(default)' }}"
+        );
+        let out = ps_output(&script, 60)
+            .expect("读取 App Paths 原默认值失败（powershell 60s 未返回），中止以避免误删现有键");
+        let value = out.trim();
+        if value == "MISSING" || value == "NODEFAULT" {
+            return None;
+        }
+        let Some(raw) = value.strip_prefix("VALUE:") else {
+            panic!("读取 App Paths 原默认值得到无法识别的输出，中止以避免误删现有键: {value:?}");
+        };
+        if raw.is_empty() {
+            None
+        } else {
+            Some(raw.to_string())
+        }
+    }
+
+    /// 测试专用注册表探测：与生产同链路，但超时放宽到 60s 并在超时时显式失败。
+    ///
+    /// 生产侧 8s 是给真实用户的等待兜底，不因 CI 放宽；测试侧把「超时」与
+    /// 「探测为空」区分开，避免把环境抖动误报成功能回归（曾出现候选=[] 的假失败）。
+    #[cfg(target_os = "windows")]
+    fn probe_candidates_for_test(variant: WbVariant) -> Vec<PathBuf> {
+        let Some(stdout) = ps_output(&windows_registry_probe_script(variant), 60) else {
+            panic!("注册表探测 PowerShell 60s 未返回，无法判定功能是否正常");
+        };
+        parse_windows_registry_path_lines(&stdout, variant)
+    }
+
+    /// 合成注册表项 + 临时目录的 RAII 夹具：Drop 时无条件清理。
+    #[cfg(target_os = "windows")]
+    struct RegistryProbeFixture {
+        /// 合成目录（temp_dir 下的自定义子目录，不在任何扫描白名单内）。
+        dir: PathBuf,
+        /// 清理时整键删除的键（Uninstall 合成项）。
+        keys: Vec<String>,
+        /// 清理时恢复原默认值的 App Paths 键：(exe 名, 原默认值)。
+        app_paths: Vec<(String, Option<String>)>,
+        cleaned: bool,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl RegistryProbeFixture {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "wb-switch-registry-probe-{tag}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("创建合成目录失败");
+            Self {
+                dir,
+                keys: Vec::new(),
+                app_paths: Vec::new(),
+                cleaned: false,
+            }
+        }
+
+        fn subdir(&self, name: &str) -> PathBuf {
+            let d = self.dir.join(name);
+            std::fs::create_dir_all(&d).expect("创建合成子目录失败");
+            d
+        }
+
+        /// 在合成目录下放一个空 exe。
+        fn stub_exe(&self, dir: &Path, file_name: &str) -> PathBuf {
+            let p = dir.join(file_name);
+            std::fs::write(&p, b"").expect("创建合成 exe 失败");
+            p
+        }
+
+        /// 写 Uninstall 合成项（先登记后写入：写入中途失败也会被清理）。
+        fn write_uninstall(&mut self, key: &str, display_name: &str, display_icon: &str) {
+            self.keys.push(key.to_string());
+            reg_try(&["delete", key, "/f"]); // 重复运行时先清同名键
+            reg_run(&[
+                "add",
+                key,
+                "/v",
+                "DisplayName",
+                "/t",
+                "REG_SZ",
+                "/d",
+                display_name,
+                "/f",
+            ]);
+            reg_run(&[
+                "add",
+                key,
+                "/v",
+                "DisplayIcon",
+                "/t",
+                "REG_SZ",
+                "/d",
+                display_icon,
+                "/f",
+            ]);
+        }
+
+        /// 写 App Paths 合成项（默认值 = exe 路径）；原默认值登记待恢复。
+        fn write_app_paths(&mut self, exe_name: &str, target: &str) {
+            let prev = read_app_paths_default(exe_name);
+            self.app_paths.push((exe_name.to_string(), prev));
+            let key = app_paths_key(exe_name);
+            reg_try(&["delete", key.as_str(), "/f"]); // 重复运行时先清同名键
+            reg_run(&[
+                "add",
+                key.as_str(),
+                "/ve",
+                "/t",
+                "REG_SZ",
+                "/d",
+                target,
+                "/f",
+            ]);
+        }
+
+        fn cleanup(&mut self) {
+            if self.cleaned {
+                return;
+            }
+            self.cleaned = true;
+            for key in &self.keys {
+                reg_try(&["delete", key.as_str(), "/f"]);
+            }
+            // 开发机可能真装了 WorkBuddy：App Paths 键不能一删了之，恢复原默认值。
+            // 已知限制：只恢复默认值，原键若还带 `Path` 等值会被一并丢弃（CI 无真实安装，
+            // 不受影响；开发机影响面为 App Paths 的按名解析，主程序仍可由默认值启动）。
+            for (exe_name, prev) in &self.app_paths {
+                let key = app_paths_key(exe_name);
+                reg_try(&["delete", key.as_str(), "/f"]);
+                if let Some(value) = prev {
+                    reg_try(&[
+                        "add",
+                        key.as_str(),
+                        "/ve",
+                        "/t",
+                        "REG_SZ",
+                        "/d",
+                        value.as_str(),
+                        "/f",
+                    ]);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+
+        /// 显式清理后重新探测：合成路径必须彻底消失（清理有效性的自检）。
+        fn cleanup_and_verify(&mut self, variants: &[WbVariant]) {
+            self.cleanup();
+            for variant in variants {
+                let after = probe_candidates_for_test(*variant);
+                assert!(
+                    !after.iter().any(|p| p.starts_with(&self.dir)),
+                    "清理后仍能探测到合成路径（{variant:?}）: {after:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Drop for RegistryProbeFixture {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    /// Uninstall 分支：DisplayName 命中档位匹配、DisplayIcon 指向自定义目录 exe
+    /// （带 `,0` 图标索引形态）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_registry_probe_resolves_custom_dir_uninstall_entry() {
+        let _guard = REGISTRY_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut fx = RegistryProbeFixture::new("uninstall");
+        let exe = fx.stub_exe(&fx.dir, "WorkBuddy.exe");
+        let key = format!(
+            r"{TEST_UNINSTALL_ROOT}\wb-switch-probe-uninstall-{}",
+            std::process::id()
+        );
+        fx.write_uninstall(&key, "WorkBuddy", &format!("\"{}\",0", exe.display()));
+
+        let cands = probe_candidates_for_test(WbVariant::Cn);
+        assert!(
+            cands.iter().any(|p| p == &exe),
+            "Uninstall DisplayIcon 未解析出自定义目录 exe（期望 {}）: 候选={cands:?}",
+            exe.display()
+        );
+
+        fx.cleanup_and_verify(&[WbVariant::Cn]);
+    }
+
+    /// App Paths 分支：默认值指向自定义目录 exe。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_registry_probe_resolves_custom_dir_app_paths_entry() {
+        let _guard = REGISTRY_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut fx = RegistryProbeFixture::new("app-paths");
+        let exe = fx.stub_exe(&fx.dir, "WorkBuddy.exe");
+        fx.write_app_paths("WorkBuddy.exe", &exe.to_string_lossy());
+
+        let cands = probe_candidates_for_test(WbVariant::Cn);
+        assert!(
+            cands.iter().any(|p| p == &exe),
+            "App Paths 默认值未解析出自定义目录 exe（期望 {}）: 候选={cands:?}",
+            exe.display()
+        );
+
+        fx.cleanup_and_verify(&[WbVariant::Cn]);
+    }
+
+    /// 档位隔离：CN/AI 合成项并存时互不串档。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_registry_probe_isolates_variants() {
+        let _guard = REGISTRY_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut fx = RegistryProbeFixture::new("variants");
+        let cn_dir = fx.subdir("cn");
+        let ai_dir = fx.subdir("ai");
+        let cn_exe = fx.stub_exe(&cn_dir, "WorkBuddy.exe");
+        let ai_exe = fx.stub_exe(&ai_dir, "WorkBuddyAI.exe");
+
+        let pid = std::process::id();
+        fx.write_uninstall(
+            &format!(r"{TEST_UNINSTALL_ROOT}\wb-switch-probe-cn-{pid}"),
+            "WorkBuddy",
+            &format!("\"{}\",0", cn_exe.display()),
+        );
+        fx.write_uninstall(
+            &format!(r"{TEST_UNINSTALL_ROOT}\wb-switch-probe-ai-{pid}"),
+            "WorkBuddyAI",
+            &format!("\"{}\",0", ai_exe.display()),
+        );
+        fx.write_app_paths("WorkBuddyAI.exe", &ai_exe.to_string_lossy());
+
+        let cn = probe_candidates_for_test(WbVariant::Cn);
+        assert!(
+            cn.iter().any(|p| p == &cn_exe),
+            "CN 未解析出自定义目录 exe: 候选={cn:?}"
+        );
+        assert!(
+            !cn.iter().any(|p| p.starts_with(&ai_dir)),
+            "CN 档位串到国际版合成目录: 候选={cn:?}"
+        );
+
+        let ai = probe_candidates_for_test(WbVariant::Ai);
+        assert!(
+            ai.iter().any(|p| p == &ai_exe),
+            "AI 未解析出自定义目录 exe: 候选={ai:?}"
+        );
+        assert!(
+            !ai.iter().any(|p| p.starts_with(&cn_dir)),
+            "AI 档位串到国内版合成目录: 候选={ai:?}"
+        );
+
+        fx.cleanup_and_verify(&WbVariant::ALL);
+    }
+
+    /// 自排除：指向 workbuddy-switch.exe 的条目不得被命中。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_registry_probe_excludes_self_entries() {
+        let _guard = REGISTRY_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut fx = RegistryProbeFixture::new("self");
+        let self_exe = fx.stub_exe(&fx.dir, "workbuddy-switch.exe");
+        let real_exe = fx.stub_exe(&fx.dir, "WorkBuddy.exe");
+
+        let pid = std::process::id();
+        // DisplayName 故意写成档位名：确保条目被探测脚本输出，由解析层的自排除拦截。
+        fx.write_uninstall(
+            &format!(r"{TEST_UNINSTALL_ROOT}\wb-switch-probe-self-{pid}"),
+            "WorkBuddy",
+            &self_exe.to_string_lossy(),
+        );
+        fx.write_uninstall(
+            &format!(r"{TEST_UNINSTALL_ROOT}\wb-switch-probe-real-{pid}"),
+            "WorkBuddy",
+            &real_exe.to_string_lossy(),
+        );
+
+        let cn = probe_candidates_for_test(WbVariant::Cn);
+        assert!(
+            cn.iter().any(|p| p == &real_exe),
+            "对照组条目未被命中，无法证明探测链路工作: 候选={cn:?}"
+        );
+        assert!(
+            !cn.iter().any(|p| p == &self_exe),
+            "自排除失效，命中 workbuddy-switch.exe: 候选={cn:?}"
+        );
+
+        fx.cleanup_and_verify(&[WbVariant::Cn]);
     }
 
     #[cfg(target_os = "macos")]
@@ -1342,30 +1861,83 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
     fn macos_pattern_fallback_selection() {
         // 主进程层：解析到路径 → 只用该路径的 Contents/MacOS；失败 → 字面量变体
         assert_eq!(
-            macos_main_patterns(None),
-            vec![
-                "WorkBuddy.app/Contents/MacOS".to_string(),
-                "CodeBuddy.app/Contents/MacOS".to_string()
-            ]
+            macos_main_patterns(None, WbVariant::Cn),
+            vec!["WorkBuddy.app/Contents/MacOS".to_string()]
         );
         assert_eq!(
-            macos_main_patterns(Some(Path::new("/Applications/WorkBuddy.app"))),
+            macos_main_patterns(None, WbVariant::Ai),
+            vec!["WorkBuddy AI.app/Contents/MacOS".to_string()]
+        );
+        assert_eq!(
+            macos_main_patterns(
+                Some(Path::new("/Applications/WorkBuddy.app")),
+                WbVariant::Cn
+            ),
             vec!["/Applications/WorkBuddy.app/Contents/MacOS".to_string()]
         );
 
         // 包内层：解析到路径 → 只用完整路径；失败 → 字面量 + 全小写变体
         assert_eq!(
-            macos_bundle_patterns(None),
+            macos_bundle_patterns(None, WbVariant::Cn),
+            vec!["WorkBuddy.app".to_string(), "workbuddy.app".to_string()]
+        );
+        assert_eq!(
+            macos_bundle_patterns(None, WbVariant::Ai),
             vec![
-                "WorkBuddy.app".to_string(),
-                "CodeBuddy.app".to_string(),
-                "workbuddy.app".to_string(),
-                "codebuddy.app".to_string()
+                "WorkBuddy AI.app".to_string(),
+                "workbuddy ai.app".to_string()
             ]
         );
         assert_eq!(
-            macos_bundle_patterns(Some(Path::new("/Applications/CodeBuddy.app"))),
-            vec!["/Applications/CodeBuddy.app".to_string()]
+            macos_bundle_patterns(
+                Some(Path::new("/Applications/WorkBuddy.app")),
+                WbVariant::Cn
+            ),
+            vec!["/Applications/WorkBuddy.app".to_string()]
+        );
+    }
+
+    /// 两档位模式串必须互斥：跨档位命中会误杀另一版客户端。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_patterns_never_cross_match() {
+        let cn_patterns = macos_main_patterns(None, WbVariant::Cn);
+        let cn_bundle = macos_bundle_patterns(None, WbVariant::Cn);
+        let ai_patterns = macos_main_patterns(None, WbVariant::Ai);
+        let ai_bundle = macos_bundle_patterns(None, WbVariant::Ai);
+
+        let cn_args = "/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy --foo";
+        let ai_args = "/Applications/WorkBuddy AI.app/Contents/MacOS/WorkBuddy AI --foo";
+        assert!(cn_patterns.iter().any(|p| cn_args.contains(p.as_str())));
+        assert!(cn_bundle.iter().any(|p| cn_args.contains(p.as_str())));
+        assert!(
+            !ai_patterns.iter().any(|p| cn_args.contains(p.as_str())),
+            "国内版进程不得命中国际版主进程模式"
+        );
+        assert!(
+            !ai_bundle.iter().any(|p| cn_args.contains(p.as_str())),
+            "国内版进程不得命中国际版包内模式"
+        );
+
+        assert!(ai_patterns.iter().any(|p| ai_args.contains(p.as_str())));
+        assert!(ai_bundle.iter().any(|p| ai_args.contains(p.as_str())));
+        assert!(
+            !cn_patterns.iter().any(|p| ai_args.contains(p.as_str())),
+            "国际版进程不得命中国内版主进程模式"
+        );
+        assert!(
+            !cn_bundle.iter().any(|p| ai_args.contains(p.as_str())),
+            "国际版进程不得命中国内版包内模式"
+        );
+
+        let ide_args = "/Applications/CodeBuddy.app/Contents/MacOS/CodeBuddy";
+        assert!(
+            !cn_patterns.iter().any(|p| ide_args.contains(p.as_str())),
+            "国际 CodeBuddy IDE 不得命中国内版 WorkBuddy 主进程模式"
+        );
+        assert!(
+            !cn_bundle.iter().any(|p| ide_args.contains(p.as_str())),
+            "国际 CodeBuddy IDE 不得命中国内版 WorkBuddy 包内模式"
         );
     }
 
@@ -1384,10 +1956,10 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
              5004 /Applications/CodeBuddy.app/Contents/MacOS/CodeBuddy\n\
              5005 /opt/tool/wb-switch/helper run\n"
         );
-        let patterns = macos_main_patterns(None);
+        let patterns = macos_main_patterns(None, WbVariant::Cn);
         let kept = filter_ps_rows(&stdout, &patterns, self_pid);
         let pids: Vec<u32> = kept.iter().map(|(pid, _)| *pid).collect();
-        assert_eq!(pids, vec![5001, 5004]);
+        assert_eq!(pids, vec![5001]);
     }
 
     #[cfg(target_os = "macos")]
@@ -1403,7 +1975,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
              5013 node ~/.workbuddy/binaries/cliguard-daemon --app_bundle /Applications/WorkBuddy.app\n\
              5014 /Applications/SomeOther.app/Contents/MacOS/SomeOther\n"
         );
-        let patterns = macos_bundle_patterns(None);
+        let patterns = macos_bundle_patterns(None, WbVariant::Cn);
         let kept = filter_ps_rows(&stdout, &patterns, self_pid);
         let pids: Vec<u32> = kept.iter().map(|(pid, _)| *pid).collect();
         assert_eq!(pids, vec![5011, 5012, 5013]);
@@ -1413,7 +1985,9 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
     #[test]
     fn macos_extract_app_bundle_from_args() {
         assert_eq!(
-            extract_app_bundle_from_args("/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy --foo"),
+            extract_app_bundle_from_args(
+                "/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy --foo"
+            ),
             Some(PathBuf::from("/Applications/WorkBuddy.app"))
         );
         assert_eq!(
@@ -1427,15 +2001,29 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_app_bundle_candidates_order() {
-        let cands = app_bundle_candidates(Path::new("/Users/tester"));
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let cands = app_bundle_candidates(Path::new("/Users/tester"), WbVariant::Cn);
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             s,
             vec![
                 "/Applications/WorkBuddy.app".to_string(),
-                "/Applications/CodeBuddy.app".to_string(),
                 "/Users/tester/Applications/WorkBuddy.app".to_string(),
-                "/Users/tester/Applications/CodeBuddy.app".to_string(),
+            ]
+        );
+
+        let ai = app_bundle_candidates(Path::new("/Users/tester"), WbVariant::Ai);
+        let s: Vec<String> = ai
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            s,
+            vec![
+                "/Applications/WorkBuddy AI.app".to_string(),
+                "/Users/tester/Applications/WorkBuddy AI.app".to_string(),
             ]
         );
     }
